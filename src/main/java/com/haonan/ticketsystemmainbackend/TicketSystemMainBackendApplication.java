@@ -1,21 +1,36 @@
 package com.haonan.ticketsystemmainbackend;
 
 import com.haonan.ticketsystemmainbackend.actor.TicketActorImpl;
+import com.haonan.ticketsystemmainbackend.service.OrderInfoService;
+import com.haonan.ticketsystemmainbackend.service.TicketStockService;
 import io.dapr.actors.runtime.ActorRuntime;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.Resource;
+import org.mybatis.spring.annotation.MapperScan;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 @SpringBootApplication(scanBasePackages = "com.haonan")
+@MapperScan("com.haonan.ticketsystemmainbackend.mapper")
 public class TicketSystemMainBackendApplication {
 
+    @Resource
+    private OrderInfoService orderInfoService;
+    @Resource
+    private TicketStockService ticketStockService;
+
     public static void main(String[] args) {
-        // 1. 在 Spring 容器启动前，向 Dapr 运行时注册我们的 Actor
-        // 第二个参数就是你说的 createActor 的 Lambda 实现：告诉 Dapr 如何 new 这个对象
+        SpringApplication.run(TicketSystemMainBackendApplication.class, args);
+    }
+
+    // 2. 在启动时，将 Service 传给 Actor 的工厂
+    @PostConstruct
+    public void registerActors() {
         ActorRuntime.getInstance().registerActor(
                 TicketActorImpl.class,
-                TicketActorImpl::new
+                (context, id) -> new TicketActorImpl(context, id, ticketStockService, orderInfoService)
         );
-        SpringApplication.run(TicketSystemMainBackendApplication.class, args);
     }
 
 }

@@ -1,5 +1,6 @@
 package com.haonan.ticketsystemmainbackend.actor;
 
+import io.dapr.actors.ActorMethod;
 import io.dapr.actors.ActorType;
 import io.dapr.actors.runtime.ActorFactory;
 import reactor.core.publisher.Mono;
@@ -8,7 +9,12 @@ import reactor.core.publisher.Mono;
 public interface TicketActor extends ActorFactory {
     
     // 扣减库存方法：传入要买的数量，返回是否成功 (true/false)
+    @ActorMethod(returns = Boolean.class)
     Mono<Boolean> deductTicket(int count);
+
+    // 支付成功回调（用于取消定时器）
+    @ActorMethod(returns = Void.class)
+    Mono<Void> confirmPayment(String orderId);
 
     // 查询当前剩余库存
     Mono<Integer> getRestCount();
