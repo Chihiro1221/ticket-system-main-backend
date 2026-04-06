@@ -8,10 +8,13 @@ import com.haonan.ticketsystemmainbackend.common.constants.OrderConstants;
 import com.haonan.ticketsystemmainbackend.common.constants.SystemConstants;
 import com.haonan.ticketsystemmainbackend.dapr.DaprClientHolder;
 import com.haonan.ticketsystemmainbackend.domain.OrderInfo;
+import com.haonan.ticketsystemmainbackend.domain.TicketOrderCommand;
 import com.haonan.ticketsystemmainbackend.dto.OrderRequest;
+import com.haonan.ticketsystemmainbackend.dto.OrderPlaceResponse;
 import com.haonan.ticketsystemmainbackend.exception.BusinessRuntimeException;
 import com.haonan.ticketsystemmainbackend.service.OrderInfoService;
 import com.haonan.ticketsystemmainbackend.util.UserLock;
+import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import io.dapr.actors.ActorId;
 import io.dapr.actors.client.ActorProxyBuilder;
 import io.dapr.client.domain.SaveStateRequest;
@@ -51,12 +54,16 @@ public class TicketStockController {
      * @return 下单响应
      */
     @PostMapping("/order")
-    public Result<?> placeOrder(@Valid @RequestBody OrderRequest request) {
+    public Result<OrderPlaceResponse> placeOrder(@Valid @RequestBody OrderRequest request) {
         String userId = request.getUserId();
         String ticketId = request.getTicketId();
         Integer count = request.getCount();
 
         log.info("收到下单请求 - 用户ID: {}, 票务ID: {}, 数量: {}", userId, ticketId, count);
+
+        if (!Integer.valueOf(SystemConstants.STOCK_DEDUCT_COUNT).equals(count)) {
+            throw new BusinessRuntimeException(ResponseCode.BAD_REQUEST, "当前场景仅支持单用户单次购买1张票");
+        }
 
         // 使用分布式锁防止同一用户并发下单
         return userLock.executeWithLock(userId, () -> {
@@ -69,32 +76,49 @@ public class TicketStockController {
                 throw new BusinessRuntimeException(ResponseCode.USER_ALREADY_PURCHASED);
             }
 
+            String orderId = IdWorker.getIdStr();
+            Map<String, String> metadata = Collections.singletonMap("ttlInSeconds", String.valueOf(SystemConstants.STATE_EXPIRY_SECONDS));
+            StateOptions stateOptions = new StateOptions(StateOptions.Consistency.STRONG, StateOptions.Concurrency.FIRST_WRITE);
+            State<String> stateRecord = new State<>(
+                    recordKey,
+                    OrderConstants.ORDER_STATUS_STR_PENDING,
+                    null,
+                    metadata,
+                    stateOptions
+            );
+            DaprClientHolder.getClient().saveBulkState(new SaveStateRequest(DaprConstants.STATE_STORE_NAME).setStates(stateRecord)).block();
+
             // 创建 Actor 代理
             TicketActor ticketActor = new ActorProxyBuilder<>(TicketActor.class, DaprClientHolder.getActorClient())
                     .build(new ActorId(ticketId));
 
             // 调用 Actor 扣减库存
-            Boolean success = ticketActor.deductTicket(count).block();
+            Boolean success;
+            try {
+                success = ticketActor.deductTicket(TicketOrderCommand.builder()
+                        .orderId(orderId)
+                        .userId(userId)
+                        .ticketId(ticketId)
+                        .count(count)
+                        .build()).block();
+            } catch (Exception e) {
+                DaprClientHolder.getClient().deleteState(DaprConstants.STATE_STORE_NAME, recordKey).block();
+                throw e;
+            }
 
             if (Boolean.TRUE.equals(success)) {
-                Map<String, String> metadata = Collections.singletonMap("ttlInSeconds", String.valueOf(SystemConstants.STATE_EXPIRY_SECONDS));
-                StateOptions stateOptions = new StateOptions(StateOptions.Consistency.STRONG, StateOptions.Concurrency.FIRST_WRITE);
-                // 写入限购预记录 (状态为 PENDING，防止用户在订单落盘前再次点击)
-                // 设置过期时间（比如15分钟，和订单超时时间一致）
-                State<String> stateRecord = new State<>(
-                        recordKey,
-                        OrderConstants.ORDER_STATUS_STR_PENDING,
-                        null,
-                        metadata,
-                        stateOptions
-                );
-                DaprClientHolder.getClient().saveBulkState(new SaveStateRequest(DaprConstants.STATE_STORE_NAME).setStates(stateRecord)).block();
                 // 获取剩余库存
                 Integer restStock = ticketActor.getRestCount().block();
 
-                log.info("下单成功 - 用户ID: {}, 票务ID: {}, 剩余库存: {}", userId, ticketId, restStock);
-                return Result.success(OrderConstants.MSG_ORDER_SUCCESS, restStock);
+                log.info("下单成功 - 用户ID: {}, 票务ID: {}, 订单ID: {}, 剩余库存: {}", userId, ticketId, orderId, restStock);
+                return Result.success(OrderConstants.MSG_ORDER_SUCCESS, OrderPlaceResponse.builder()
+                        .orderId(orderId)
+                        .ticketId(ticketId)
+                        .userId(userId)
+                        .restStock(restStock)
+                        .build());
             } else {
+                DaprClientHolder.getClient().deleteState(DaprConstants.STATE_STORE_NAME, recordKey).block();
                 log.warn("下单失败 - 库存不足，用户ID: {}, 票务ID: {}", userId, ticketId);
                 throw new BusinessRuntimeException(ResponseCode.STOCK_INSUFFICIENT);
             }
@@ -126,7 +150,6 @@ public class TicketStockController {
     @PostMapping("/payment/confirm")
     public Result<String> confirmPayment(@RequestBody OrderInfo orderInfoReq) {
         String orderId = orderInfoReq.getOrderId();
-        String ticketId = orderInfoReq.getTicketId();
         if (StringUtils.isBlank(orderId)) {
             throw new BusinessRuntimeException(ResponseCode.BAD_REQUEST);
         }
@@ -134,15 +157,18 @@ public class TicketStockController {
         if (orderInfo == null) {
             throw new BusinessRuntimeException(ResponseCode.ORDER_NOT_FOUND);
         }
+        if (orderInfo.getStatus() == OrderConstants.ORDER_STATUS_PAID) {
+            throw new BusinessRuntimeException(ResponseCode.ORDER_ALREADY_PAID);
+        }
         // 已取消
         if (orderInfo.getStatus() == OrderConstants.ORDER_STATUS_CANCELLED) {
             throw new BusinessRuntimeException(ResponseCode.ORDER_ALREADY_CANCELLED);
         }
         TicketActor ticketActor = new ActorProxyBuilder<>(TicketActor.class, DaprClientHolder.getActorClient())
-                .build(new ActorId(ticketId));
+                .build(new ActorId(orderInfo.getTicketId()));
 
         ticketActor.confirmPayment(orderInfo).block();
-        log.info("支付确认成功 - 订单ID: {}, 票务ID: {}", orderId, ticketId);
+        log.info("支付确认成功 - 订单ID: {}, 票务ID: {}", orderId, orderInfo.getTicketId());
 
         return Result.success("支付确认成功", orderId);
     }

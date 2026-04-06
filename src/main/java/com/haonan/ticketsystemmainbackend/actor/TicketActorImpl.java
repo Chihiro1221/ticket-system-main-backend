@@ -1,6 +1,5 @@
 package com.haonan.ticketsystemmainbackend.actor;
 
-import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import com.haonan.ticketsystemmainbackend.common.constants.DaprConstants;
 import com.haonan.ticketsystemmainbackend.common.constants.OrderConstants;
 import com.haonan.ticketsystemmainbackend.common.constants.SystemConstants;
@@ -8,6 +7,7 @@ import com.haonan.ticketsystemmainbackend.dapr.DaprClientHolder;
 import com.haonan.ticketsystemmainbackend.domain.OrderCreatedEvent;
 import com.haonan.ticketsystemmainbackend.domain.OrderInfo;
 import com.haonan.ticketsystemmainbackend.domain.TicketStock;
+import com.haonan.ticketsystemmainbackend.domain.TicketOrderCommand;
 import com.haonan.ticketsystemmainbackend.service.OrderInfoService;
 import com.haonan.ticketsystemmainbackend.service.TicketStockService;
 import io.dapr.actors.ActorId;
@@ -37,44 +37,41 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
     }
 
     @Override
-    public Mono<Boolean> deductTicket(int count) {
-        // 1. 直接尝试获取，利用 onErrorResume 处理“Key 不存在”的情况
-        return super.getActorStateManager().get(SystemConstants.ACTOR_STOCK_KEY, Integer.class)
-                .onErrorResume(e -> {
-                    // 如果报错或找不到，说明是第一次加载，去查数据库
-                    log.info(">>> Redis 未命中，尝试从数据库加载 ID: {}", this.getId());
-                    return Mono.fromCallable(() -> {
-                        // 使用动态 ID 查询数据库
-                        TicketStock ts = ticketStockService.getById(this.getId().toString());
-                        return ts != null ? ts.getStock() : 0;
-                    }).subscribeOn(Schedulers.boundedElastic());
-                })
+    public Mono<Boolean> deductTicket(TicketOrderCommand command) {
+        return loadCurrentStock()
                 .flatMap(currentStock -> {
+                    int count = command.getCount() == null ? SystemConstants.STOCK_DEDUCT_COUNT : command.getCount();
                     if (currentStock >= count) {
                         int newStock = currentStock - count;
-                        log.info(">>> 扣减库存，当前库存: {}, 扣减数量: {}, 新库存: {}", currentStock, count, newStock);
-                        // 直接通过静态方法调用
+                        String orderId = command.getOrderId();
+                        String ticketId = command.getTicketId();
+                        String userId = command.getUserId();
+                        OrderInfo reminderOrder = OrderInfo.builder()
+                                .orderId(orderId)
+                                .ticketId(ticketId)
+                                .userId(userId)
+                                .status(OrderConstants.ORDER_STATUS_PENDING)
+                                .build();
+                        OrderCreatedEvent event = OrderCreatedEvent.builder()
+                                .ticketId(ticketId)
+                                .userId(userId)
+                                .orderId(orderId)
+                                .stock_count(count)
+                                .timestamp(System.currentTimeMillis())
+                                .build();
+
+                        log.info(">>> 扣减库存，当前库存: {}, 扣减数量: {}, 新库存: {}, 订单ID: {}", currentStock, count, newStock, orderId);
                         DaprClient client = DaprClientHolder.getClient();
-                        String orderId = IdWorker.getIdStr();
-                        // 注册 Reminder: 10分钟后触发，如果不取消，就回滚库存
-                        // 参数：提醒名称, 关联数据, 延迟时间, 周期（这里设为-1表示只执行一次）
-                        log.info("注册提醒器");
                         return registerReminder(
                                 SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT + orderId,
-                                OrderInfo.builder().orderId(orderId).ticketId(this.getId().toString()).build(),
+                                reminderOrder,
                                 Duration.ofMinutes(SystemConstants.ORDER_TIMEOUT_MINUTES),
                                 Duration.ofMillis(SystemConstants.REMINDER_PERIOD_ONCE)
-                        ).then(
-                                getActorStateManager().set(SystemConstants.ACTOR_STOCK_KEY, newStock)
-                        ).then(Mono.defer(() -> {
-                            // 发送消息队列扣减库存
-                            return client.publishEvent(DaprConstants.PUBSUB_NAME, DaprConstants.TOPIC_ORDER, OrderCreatedEvent.builder()
-                                    .ticketId(this.getId().toString())
-                                    .orderId(orderId)
-                                    .timestamp(System.currentTimeMillis())
-                                    .build()
-                            );
-                        })).thenReturn(true);
+                        ).then(getActorStateManager().set(SystemConstants.ACTOR_STOCK_KEY, newStock))
+                                .then(getActorStateManager().save())
+                                .then(client.publishEvent(DaprConstants.PUBSUB_NAME, DaprConstants.TOPIC_ORDER, event))
+                                .thenReturn(true)
+                                .onErrorResume(e -> compensateOrderCreationFailure(orderId, currentStock, e));
                     }
                     return Mono.just(false);
                 });
@@ -82,8 +79,7 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
 
     @Override
     public Mono<Integer> getRestCount() {
-        return super.getActorStateManager().get(SystemConstants.ACTOR_STOCK_KEY, Integer.class)
-                .defaultIfEmpty(SystemConstants.DEFAULT_STOCK);
+        return loadCurrentStock();
     }
 
     @Override
@@ -100,9 +96,9 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
                 .flatMap(success -> {
                     if (success) {
                         log.info("订单 {} 数据库更新成功，正在撤销回收闹钟...", orderId);
-                        ticketStockService.finalizePurchaseRecord(userId, ticketId).block();
+                        return ticketStockService.finalizePurchaseRecord(userId, ticketId)
+                                .then(unregisterReminder(SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT + orderId));
                         // 只有更新成功（确认支付），才撕掉闹钟
-                        return unregisterReminder(SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT + orderId);
                     } else {
                         log.warn("订单 {} 状态变迁失败，闹钟可能已触发或订单异常", orderId);
                         // Todo: 触发退款逻辑.....
@@ -142,28 +138,94 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
         String userId = orderInfo.getUserId();
         String ticketId = orderInfo.getTicketId();
         log.warn("检测到订单 {} 超时提醒触发...", orderId);
-        // 1. 将阻塞的数据库操作包装起来
-        return Mono.fromCallable(() -> orderInfoService.cancelOrderAndRestoreStock(orderId))
-                .subscribeOn(Schedulers.boundedElastic()) // 【核心】切换到专门处理 I/O 的线程池
-                .flatMap(dbSuccess -> {
-                    if (!dbSuccess) {
-                        log.info("订单 {} 无需回收（可能已支付或已手动取消）", orderId);
-                        return Mono.empty();
+        return Mono.fromCallable(() -> orderInfoService.getById(orderId))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(existingOrder -> {
+                    if (existingOrder == null) {
+                        log.warn("订单 {} 未落库，执行 Actor 库存恢复和购买记录清理", orderId);
+                        return clearPurchaseRecord(userId, ticketId)
+                                .then(restoreActorStock(SystemConstants.STOCK_RESTORE_COUNT));
                     }
-                    String recordKey = String.format(DaprConstants.KEY_PURCHASE_RECORD_LEGACY_FORMAT, userId, ticketId);
-                    DaprClientHolder.getClient().deleteState(DaprConstants.STATE_STORE_NAME, recordKey)
-                            .doOnSuccess(v -> log.info("用户 {} 的限购记录已清除，可重新购票", userId));
-                    // 只有数据库操作成功了（确认回收了），才去更新 Actor 的内存状态
-                    return getActorStateManager().get(SystemConstants.ACTOR_STOCK_KEY, Integer.class)
-                            .flatMap(currentStock -> {
-                                int restoredStock = currentStock + SystemConstants.STOCK_RESTORE_COUNT;
-                                log.info("Actor 内存库存回滚：{} -> {}", currentStock, restoredStock);
-                                return getActorStateManager().set(SystemConstants.ACTOR_STOCK_KEY, restoredStock)
-                                        .then(getActorStateManager().save());
-                            });
+                    if (existingOrder.getStatus() == OrderConstants.ORDER_STATUS_PENDING) {
+                        return Mono.fromCallable(() -> orderInfoService.cancelOrderAndRestoreStock(orderId))
+                                .subscribeOn(Schedulers.boundedElastic())
+                                .flatMap(dbSuccess -> {
+                                    if (!dbSuccess) {
+                                        log.info("订单 {} 无需回收（可能已支付或已手动取消）", orderId);
+                                        return Mono.empty();
+                                    }
+                                    return clearPurchaseRecord(userId, ticketId)
+                                            .then(restoreActorStock(SystemConstants.STOCK_RESTORE_COUNT));
+                                });
+                    }
+                    if (existingOrder.getStatus() == OrderConstants.ORDER_STATUS_CANCELLED) {
+                        return clearPurchaseRecord(userId, ticketId);
+                    }
+                    log.info("订单 {} 已支付，无需回收", orderId);
+                    return Mono.empty();
                 })
                 .doOnSuccess(v -> log.info("订单 {} 全链路回收任务完成", orderId))
                 .doOnError(e -> log.error("回收订单 {} 失败: {}", orderId, e.getMessage()))
                 .then();
+    }
+
+    private Mono<Integer> loadCurrentStock() {
+        return super.getActorStateManager().get(SystemConstants.ACTOR_STOCK_KEY, Integer.class)
+                .onErrorResume(e -> {
+                    log.warn("读取 Actor 库存状态失败，尝试从数据库加载，actorId={}", this.getId(), e);
+                    return loadStockFromDatabase();
+                })
+                .switchIfEmpty(Mono.defer(() -> {
+                    log.info(">>> Actor 状态未命中，尝试从数据库加载 ID: {}", this.getId());
+                    return loadStockFromDatabase();
+                }));
+    }
+
+    /**
+     * 订单创建失败
+     * @param orderId
+     * @param currentStock
+     * @param throwable
+     * @return
+     */
+    private Mono<Boolean> compensateOrderCreationFailure(String orderId, int currentStock, Throwable throwable) {
+        log.error("订单 {} 创建链路失败，开始补偿: {}", orderId, throwable.getMessage());
+        return unregisterReminder(SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT + orderId)
+                .onErrorResume(e -> Mono.empty())
+                .then(getActorStateManager().set(SystemConstants.ACTOR_STOCK_KEY, currentStock))
+                .then(getActorStateManager().save())
+                .then(Mono.error(throwable));
+    }
+
+    private Mono<Void> clearPurchaseRecord(String userId, String ticketId) {
+        if (userId == null || ticketId == null) {
+            return Mono.empty();
+        }
+        String recordKey = String.format(DaprConstants.KEY_PURCHASE_RECORD_FORMAT, userId, ticketId);
+        return DaprClientHolder.getClient().deleteState(DaprConstants.STATE_STORE_NAME, recordKey)
+                .doOnSuccess(v -> log.info("用户 {} 的限购记录已清除，可重新购票", userId));
+    }
+
+    private Mono<Void> restoreActorStock(int restoreCount) {
+        return super.getActorStateManager().get(SystemConstants.ACTOR_STOCK_KEY, Integer.class)
+                .flatMap(currentStock -> {
+                    int restoredStock = currentStock + restoreCount;
+                    log.info("Actor 内存库存回滚：{} -> {}", currentStock, restoredStock);
+                    return getActorStateManager().set(SystemConstants.ACTOR_STOCK_KEY, restoredStock)
+                            .then(getActorStateManager().save());
+                })
+                .switchIfEmpty(Mono.defer(() -> {
+                    log.warn("Actor 库存状态缺失，使用数据库库存重建 Actor 状态，actorId={}", this.getId());
+                    return loadStockFromDatabase()
+                            .flatMap(dbStock -> getActorStateManager().set(SystemConstants.ACTOR_STOCK_KEY, dbStock)
+                                    .then(getActorStateManager().save()));
+                }));
+    }
+
+    private Mono<Integer> loadStockFromDatabase() {
+        return Mono.fromCallable(() -> {
+            TicketStock ts = ticketStockService.getById(this.getId().toString());
+            return ts != null ? ts.getStock() : 0;
+        }).subscribeOn(Schedulers.boundedElastic());
     }
 }

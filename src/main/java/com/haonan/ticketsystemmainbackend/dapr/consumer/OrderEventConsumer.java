@@ -1,8 +1,7 @@
 package com.haonan.ticketsystemmainbackend.dapr.consumer;
 
-import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import com.haonan.ticketsystemmainbackend.common.constants.DaprConstants;
-import com.haonan.ticketsystemmainbackend.common.constants.SystemConstants;
+import com.haonan.ticketsystemmainbackend.common.constants.OrderConstants;
 import com.haonan.ticketsystemmainbackend.domain.OrderCreatedEvent;
 import com.haonan.ticketsystemmainbackend.domain.OrderInfo;
 import com.haonan.ticketsystemmainbackend.domain.TicketStock;
@@ -41,8 +40,8 @@ public class OrderEventConsumer {
         // 利用数据库的行锁特性，确保强一致性
         boolean updated = ticketStockService.lambdaUpdate()
                 .eq(TicketStock::getId, event.getTicketId())
-                .gt(TicketStock::getStock, 0) // 必须大于0才能扣
-                .setDecrBy(TicketStock::getStock, SystemConstants.STOCK_DEDUCT_COUNT)
+                .ge(TicketStock::getStock, event.getStock_count())
+                .setDecrBy(TicketStock::getStock, event.getStock_count())
                 .update();
 
         if (!updated) {
@@ -55,8 +54,9 @@ public class OrderEventConsumer {
         try {
             OrderInfo orderInfo = OrderInfo.builder()
                     .ticketId(event.getTicketId())
-                    .orderId(event.getOrderId()) // 建议这里的 orderId 就是 event 里的 ID
-                    .userId(IdWorker.getIdStr())   // 应该从事件里取，不要生成假的
+                    .orderId(event.getOrderId())
+                    .userId(event.getUserId())
+                    .status(OrderConstants.ORDER_STATUS_PENDING)
                     .build();
             orderInfoService.save(orderInfo);
         } catch (DuplicateKeyException e) {
