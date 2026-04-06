@@ -1,6 +1,8 @@
 package com.haonan.ticketsystemmainbackend.service.impl;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.haonan.ticketsystemmainbackend.common.constants.OrderConstants;
+import com.haonan.ticketsystemmainbackend.common.constants.SystemConstants;
 import com.haonan.ticketsystemmainbackend.domain.OrderInfo;
 import com.haonan.ticketsystemmainbackend.domain.TicketStock;
 import com.haonan.ticketsystemmainbackend.mapper.OrderInfoMapper;
@@ -28,8 +30,8 @@ public class OrderInfoServiceImpl extends ServiceImpl<OrderInfoMapper, OrderInfo
     public boolean cancelOrderAndRestoreStock(String orderId) {
         boolean success = lambdaUpdate()
                 .eq(OrderInfo::getOrderId, orderId)
-                .eq(OrderInfo::getStatus, 0) // 只有状态为 待支付(0) 的时候才准许修改
-                .set(OrderInfo::getStatus, 3) // 修改为 已取消(3)
+                .eq(OrderInfo::getStatus, OrderConstants.ORDER_STATUS_PENDING) // 只有状态为 待支付 的时候才准许修改
+                .set(OrderInfo::getStatus, OrderConstants.ORDER_STATUS_CANCELLED) // 修改为 已取消
                 .update();
         if (!success) {
             log.info("订单 {} 状态已变迁，无需回收库存", orderId);
@@ -39,7 +41,7 @@ public class OrderInfoServiceImpl extends ServiceImpl<OrderInfoMapper, OrderInfo
         OrderInfo orderInfo = this.getById(orderId);
         boolean stockRestored = ticketStockService.lambdaUpdate()
                 .eq(TicketStock::getId, orderInfo.getTicketId())
-                .setIncrBy(TicketStock::getStock, 1)
+                .setIncrBy(TicketStock::getStock, SystemConstants.STOCK_RESTORE_COUNT)
                 .update();
 
         if (!stockRestored) {

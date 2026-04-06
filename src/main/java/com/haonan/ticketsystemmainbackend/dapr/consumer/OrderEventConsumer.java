@@ -1,6 +1,8 @@
 package com.haonan.ticketsystemmainbackend.dapr.consumer;
 
 import com.baomidou.mybatisplus.core.toolkit.IdWorker;
+import com.haonan.ticketsystemmainbackend.common.constants.DaprConstants;
+import com.haonan.ticketsystemmainbackend.common.constants.SystemConstants;
 import com.haonan.ticketsystemmainbackend.domain.OrderCreatedEvent;
 import com.haonan.ticketsystemmainbackend.domain.OrderInfo;
 import com.haonan.ticketsystemmainbackend.domain.TicketStock;
@@ -29,7 +31,7 @@ public class OrderEventConsumer {
 
     // pubsubName 是你在 dapr/components/pubsub.yaml 中配置的 name
     // topic 是你发布消息时指定的 topic 名称
-    @Topic(pubsubName = "pubsub", name = "order_topic")
+    @Topic(pubsubName = DaprConstants.PUBSUB_NAME, name = DaprConstants.TOPIC_ORDER)
     @PostMapping("/handleOrder")
     @Transactional(rollbackFor = Exception.class)
     public void handleOrder(@RequestBody CloudEvent<OrderCreatedEvent> cloudEvent) {
@@ -40,7 +42,7 @@ public class OrderEventConsumer {
         boolean updated = ticketStockService.lambdaUpdate()
                 .eq(TicketStock::getId, event.getTicketId())
                 .gt(TicketStock::getStock, 0) // 必须大于0才能扣
-                .setDecrBy(TicketStock::getStock, 1)
+                .setDecrBy(TicketStock::getStock, SystemConstants.STOCK_DEDUCT_COUNT)
                 .update();
 
         if (!updated) {

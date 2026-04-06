@@ -1,5 +1,6 @@
 package com.haonan.ticketsystemmainbackend.actor;
 
+import com.haonan.ticketsystemmainbackend.domain.OrderInfo;
 import io.dapr.actors.ActorMethod;
 import io.dapr.actors.ActorType;
 import io.dapr.actors.runtime.ActorFactory;
@@ -14,7 +15,7 @@ public interface TicketActor extends ActorFactory {
 
     // 支付成功回调（用于取消定时器）
     @ActorMethod(returns = Void.class)
-    Mono<Void> confirmPayment(String orderId);
+    Mono<Void> confirmPayment(OrderInfo orderInfo);
 
     // 查询当前剩余库存
     Mono<Integer> getRestCount();
