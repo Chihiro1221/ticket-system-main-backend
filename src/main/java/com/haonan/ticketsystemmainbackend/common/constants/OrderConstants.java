@@ -46,6 +46,6 @@ public final class OrderConstants {
     /**
      * 下单成功消息
      */
-    public static final String MSG_ORDER_SUCCESS = "下单成功，请在10分钟内完成支付";
+    public static final String MSG_ORDER_SUCCESS = "下单成功，请在15分钟内完成支付";
 
 }

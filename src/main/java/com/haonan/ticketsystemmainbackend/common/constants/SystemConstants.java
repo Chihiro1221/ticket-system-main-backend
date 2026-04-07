@@ -15,7 +15,7 @@ public final class SystemConstants {
     // ========== 时间相关常量（单位：秒） ==========
 
     /**
-     * 订单超时时间（10分钟）
+     * 订单超时时间（15分钟）
      */
     public static final int ORDER_TIMEOUT_MINUTES = 15;
 

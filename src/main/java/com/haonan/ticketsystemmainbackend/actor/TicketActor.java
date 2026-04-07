@@ -19,5 +19,6 @@ public interface TicketActor extends ActorFactory {
     Mono<Void> confirmPayment(OrderInfo orderInfo);
 
     // 查询当前剩余库存
+    @ActorMethod(returns = Integer.class)
     Mono<Integer> getRestCount();
 }
