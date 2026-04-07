@@ -3,6 +3,7 @@ package com.haonan.ticketsystemmainbackend.controller;
 import com.haonan.ticketsystemmainbackend.common.Result;
 import com.haonan.ticketsystemmainbackend.domain.TicketInfo;
 import com.haonan.ticketsystemmainbackend.dto.TicketCreateRequest;
+import com.haonan.ticketsystemmainbackend.dto.TicketInventoryResponse;
 import com.haonan.ticketsystemmainbackend.dto.TicketUpdateRequest;
 import com.haonan.ticketsystemmainbackend.service.TicketInfoService;
 import jakarta.annotation.Resource;
@@ -46,13 +47,13 @@ public class TicketInfoController {
     }
 
     @GetMapping("/{ticketId}")
-    public Result<TicketInfo> getTicketDetail(@PathVariable String ticketId) {
+    public Result<TicketInventoryResponse> getTicketDetail(@PathVariable String ticketId) {
         return Result.success(ticketInfoService.getTicketDetail(ticketId));
     }
 
     @GetMapping
-    public Result<List<TicketInfo>> listTickets(@RequestParam(required = false) String name,
-                                                @RequestParam(required = false) Integer status) {
+    public Result<List<TicketInventoryResponse>> listTickets(@RequestParam(required = false) String name,
+                                                             @RequestParam(required = false) Integer status) {
         return Result.success(ticketInfoService.listTickets(name, status));
     }
 }

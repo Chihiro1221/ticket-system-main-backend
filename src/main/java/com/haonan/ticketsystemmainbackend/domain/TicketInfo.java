@@ -30,6 +30,11 @@ public class TicketInfo {
     private String description;
 
     /**
+     * 场馆/地点
+     */
+    private String venue;
+
+    /**
      * 票价
      */
     private BigDecimal price;

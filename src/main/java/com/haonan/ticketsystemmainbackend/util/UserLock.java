@@ -12,6 +12,7 @@ import io.dapr.client.domain.UnlockResponseStatus;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+
 import java.util.UUID;
 
 /**
@@ -46,22 +47,40 @@ public class UserLock {
      * 带锁执行操作（推荐用法）
      */
     public <T> T executeWithLock(String userId, LockAction<T> action) {
-        // 1. 生成唯一的锁持有者 ID (OwnerId)
+        return executeWithLockMetrics(userId, action).getResult();
+    }
+
+    public <T> LockExecutionResult<T> executeWithLockMetrics(String userId, LockAction<T> action) {
         String lockOwner = UUID.randomUUID().toString();
         String resourceId = DaprConstants.USER_LOCK_PREFIX + userId;
 
         boolean acquired = false;
+        long totalStart = System.nanoTime();
+        long tryLockStart = totalStart;
+        long tryLockMs = 0L;
+        long businessMs = 0L;
+        long unlockMs = 0L;
+        T result = null;
+
         try {
             acquired = tryLock(resourceId, lockOwner);
+            tryLockMs = elapsedMs(tryLockStart);
             if (!acquired) {
                 throw new BusinessRuntimeException(ResponseCode.TOO_MANY_REQUESTS);
             }
-            return action.execute();
+
+            long businessStart = System.nanoTime();
+            result = action.execute();
+            businessMs = elapsedMs(businessStart);
         } finally {
             if (acquired) {
+                long unlockStart = System.nanoTime();
                 unlock(resourceId, lockOwner);
+                unlockMs = elapsedMs(unlockStart);
             }
         }
+
+        return new LockExecutionResult<>(result, tryLockMs, businessMs, unlockMs, elapsedMs(totalStart), acquired);
     }
 
     /**
@@ -69,7 +88,6 @@ public class UserLock {
      */
     private boolean tryLock(String resourceId, String lockOwner) {
         try {
-            // 构建加锁请求对象
             LockRequest lockRequest = new LockRequest(
                     DaprConstants.LOCK_STORE_NAME,
                     resourceId,
@@ -77,7 +95,6 @@ public class UserLock {
                     SystemConstants.LOCK_EXPIRY_SECONDS
             );
 
-            // 调用 tryLock 并阻塞获取结果 (Mono<Boolean>)
             Boolean success = previewClient.tryLock(lockRequest).block();
             return success != null && success;
         } catch (Exception e) {
@@ -91,20 +108,14 @@ public class UserLock {
      */
     private void unlock(String resourceId, String lockOwner) {
         try {
-            // 构建释放锁请求对象
             UnlockRequest unlockRequest = new UnlockRequest(
                     DaprConstants.LOCK_STORE_NAME,
                     resourceId,
                     lockOwner
             );
 
-            // 调用 unlock 并获取状态 (Mono<UnlockResponseStatus>)
             UnlockResponseStatus status = previewClient.unlock(unlockRequest).block();
-
-            // UnlockResponseStatus 是一个枚举，包含了 SUCCESS, LOCK_DOES_NOT_EXIST, LOCK_BELONGS_TO_OTHERS 等状态
-            if (status == UnlockResponseStatus.SUCCESS) {
-                log.info("资源 {} 释放成功", resourceId);
-            } else {
+            if (status != UnlockResponseStatus.SUCCESS) {
                 log.warn("资源 {} 释放失败或已过期，当前状态: {}", resourceId, status.name());
             }
         } catch (Exception e) {
@@ -112,8 +123,54 @@ public class UserLock {
         }
     }
 
+    private long elapsedMs(long startNano) {
+        return (System.nanoTime() - startNano) / 1_000_000;
+    }
+
     @FunctionalInterface
     public interface LockAction<T> {
         T execute();
+    }
+
+    public static class LockExecutionResult<T> {
+        private final T result;
+        private final long tryLockMs;
+        private final long businessMs;
+        private final long unlockMs;
+        private final long totalMs;
+        private final boolean acquired;
+
+        public LockExecutionResult(T result, long tryLockMs, long businessMs, long unlockMs, long totalMs, boolean acquired) {
+            this.result = result;
+            this.tryLockMs = tryLockMs;
+            this.businessMs = businessMs;
+            this.unlockMs = unlockMs;
+            this.totalMs = totalMs;
+            this.acquired = acquired;
+        }
+
+        public T getResult() {
+            return result;
+        }
+
+        public long getTryLockMs() {
+            return tryLockMs;
+        }
+
+        public long getBusinessMs() {
+            return businessMs;
+        }
+
+        public long getUnlockMs() {
+            return unlockMs;
+        }
+
+        public long getTotalMs() {
+            return totalMs;
+        }
+
+        public boolean isAcquired() {
+            return acquired;
+        }
     }
 }

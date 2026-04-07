@@ -10,9 +10,9 @@ import reactor.core.publisher.Mono;
 @ActorType(name = "TicketActor")
 public interface TicketActor extends ActorFactory {
     
-    // 扣减库存方法：传入要买的数量，返回是否成功 (true/false)
-    @ActorMethod(returns = Boolean.class)
-    Mono<Boolean> deductTicket(TicketOrderCommand command);
+    // 扣减库存方法：成功时直接返回扣减后的剩余库存，失败返回 null
+    @ActorMethod(returns = Integer.class)
+    Mono<Integer> deductTicket(TicketOrderCommand command);
 
     // 支付成功回调（用于取消定时器）
     @ActorMethod(returns = Void.class)

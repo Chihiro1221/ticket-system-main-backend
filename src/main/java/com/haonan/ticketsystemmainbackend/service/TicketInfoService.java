@@ -3,6 +3,7 @@ package com.haonan.ticketsystemmainbackend.service;
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.haonan.ticketsystemmainbackend.domain.TicketInfo;
 import com.haonan.ticketsystemmainbackend.dto.TicketCreateRequest;
+import com.haonan.ticketsystemmainbackend.dto.TicketInventoryResponse;
 import com.haonan.ticketsystemmainbackend.dto.TicketUpdateRequest;
 import java.util.List;
 
@@ -17,7 +18,7 @@ public interface TicketInfoService extends IService<TicketInfo> {
 
     void deleteTicket(String ticketId);
 
-    TicketInfo getTicketDetail(String ticketId);
+    TicketInventoryResponse getTicketDetail(String ticketId);
 
-    List<TicketInfo> listTickets(String name, Integer status);
+    List<TicketInventoryResponse> listTickets(String name, Integer status);
 }

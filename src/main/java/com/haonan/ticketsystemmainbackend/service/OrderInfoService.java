@@ -1,7 +1,9 @@
 package com.haonan.ticketsystemmainbackend.service;
 
 import com.haonan.ticketsystemmainbackend.domain.OrderInfo;
+import com.haonan.ticketsystemmainbackend.dto.OrderSummaryResponse;
 import com.baomidou.mybatisplus.extension.service.IService;
+import java.util.List;
 
 /**
  * @author heart
@@ -10,4 +12,6 @@ import com.baomidou.mybatisplus.extension.service.IService;
  */
 public interface OrderInfoService extends IService<OrderInfo> {
     boolean cancelOrderAndRestoreStock(String orderId);
+
+    List<OrderSummaryResponse> listCurrentUserOrders(String userId);
 }

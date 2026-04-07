@@ -36,4 +36,9 @@ public class TicketOrderCommand implements Serializable {
      * 购买数量，当前简化为固定 1
      */
     private Integer count;
+
+    /**
+     * 控制器发起 Actor 调用的时间戳，用于估算进入 Actor 前的等待时间
+     */
+    private Long actorInvokeAtMs;
 }

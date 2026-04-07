@@ -25,6 +25,11 @@ public class TicketStock {
     private String name;
 
     /**
+     * 总库存数量
+     */
+    private Integer totalStock;
+
+    /**
      * 当前库存数量
      */
     private Integer stock;
@@ -52,6 +57,7 @@ public class TicketStock {
         sb.append("Hash = ").append(hashCode());
         sb.append(", id=").append(id);
         sb.append(", name=").append(name);
+        sb.append(", totalStock=").append(totalStock);
         sb.append(", stock=").append(stock);
         sb.append(", version=").append(version);
         sb.append(", createTime=").append(createTime);

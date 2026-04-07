@@ -6,8 +6,8 @@ import com.haonan.ticketsystemmainbackend.common.constants.SystemConstants;
 import com.haonan.ticketsystemmainbackend.dapr.DaprClientHolder;
 import com.haonan.ticketsystemmainbackend.domain.OrderCreatedEvent;
 import com.haonan.ticketsystemmainbackend.domain.OrderInfo;
-import com.haonan.ticketsystemmainbackend.domain.TicketStock;
 import com.haonan.ticketsystemmainbackend.domain.TicketOrderCommand;
+import com.haonan.ticketsystemmainbackend.domain.TicketStock;
 import com.haonan.ticketsystemmainbackend.service.OrderInfoService;
 import com.haonan.ticketsystemmainbackend.service.TicketStockService;
 import io.dapr.actors.ActorId;
@@ -23,7 +23,6 @@ import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
 
-// 注解指定 Actor 的类型名称，网关调用时要用到
 @ActorType(name = "TicketActor")
 @Slf4j
 public class TicketActorImpl extends AbstractActor implements TicketActor, Remindable {
@@ -37,9 +36,12 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
     }
 
     @Override
-    public Mono<Boolean> deductTicket(TicketOrderCommand command) {
+    public Mono<Integer> deductTicket(TicketOrderCommand command) {
+        long totalStart = System.nanoTime();
+        long queueWaitMs = command.getActorInvokeAtMs() == null ? -1L : Math.max(System.currentTimeMillis() - command.getActorInvokeAtMs(), 0L);
         return loadCurrentStock()
                 .flatMap(currentStock -> {
+                    long loadStockMs = elapsedMs(totalStart);
                     int count = command.getCount() == null ? SystemConstants.STOCK_DEDUCT_COUNT : command.getCount();
                     if (currentStock >= count) {
                         int newStock = currentStock - count;
@@ -60,8 +62,8 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
                                 .timestamp(System.currentTimeMillis())
                                 .build();
 
-                        log.info(">>> 扣减库存，当前库存: {}, 扣减数量: {}, 新库存: {}, 订单ID: {}", currentStock, count, newStock, orderId);
                         DaprClient client = DaprClientHolder.getClient();
+                        long writeActorStart = System.nanoTime();
                         return registerReminder(
                                 SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT + orderId,
                                 reminderOrder,
@@ -70,10 +72,16 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
                         ).then(getActorStateManager().set(SystemConstants.ACTOR_STOCK_KEY, newStock))
                                 .then(getActorStateManager().save())
                                 .then(client.publishEvent(DaprConstants.PUBSUB_NAME, DaprConstants.TOPIC_ORDER, event))
-                                .thenReturn(true)
+                                .thenReturn(newStock)
+                                .doOnSuccess(restStock -> log.info(
+                                        "[Actor分析] orderId={} 排队={}ms | 执行={}ms | 读库存={}ms | 写状态并发事件={}ms | 库存 {} -> {}",
+                                        orderId, queueWaitMs, elapsedMs(totalStart), loadStockMs, elapsedMs(writeActorStart), currentStock, newStock
+                                ))
                                 .onErrorResume(e -> compensateOrderCreationFailure(orderId, currentStock, e));
                     }
-                    return Mono.just(false);
+                    log.info("[Actor分析] orderId={} result=STOCK_INSUFFICIENT 排队={}ms | 执行={}ms | 读库存={}ms | 库存={}",
+                            command.getOrderId(), queueWaitMs, elapsedMs(totalStart), loadStockMs, currentStock);
+                    return Mono.empty();
                 });
     }
 
@@ -87,6 +95,9 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
         String orderId = orderInfo.getOrderId();
         String ticketId = orderInfo.getTicketId();
         String userId = orderInfo.getUserId();
+        long totalStart = System.nanoTime();
+        long updateOrderStart = System.nanoTime();
+
         return Mono.fromCallable(() -> orderInfoService.lambdaUpdate()
                         .eq(OrderInfo::getOrderId, orderId)
                         .eq(OrderInfo::getStatus, OrderConstants.ORDER_STATUS_PENDING)
@@ -94,21 +105,23 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
                         .update())
                 .subscribeOn(Schedulers.boundedElastic())
                 .flatMap(success -> {
+                    long updateOrderMs = elapsedMs(updateOrderStart);
                     if (success) {
-                        log.info("订单 {} 数据库更新成功，正在撤销回收闹钟...", orderId);
+                        long finalizeStart = System.nanoTime();
                         return ticketStockService.finalizePurchaseRecord(userId, ticketId)
-                                .then(unregisterReminder(SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT + orderId));
-                        // 只有更新成功（确认支付），才撕掉闹钟
+                                .then(unregisterReminder(SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT + orderId))
+                                .doOnSuccess(v -> log.info(
+                                        "[Actor支付分析] orderId={} total={}ms | 改订单状态={}ms | 清记录和闹钟={}ms",
+                                        orderId, elapsedMs(totalStart), updateOrderMs, elapsedMs(finalizeStart)
+                                ));
                     } else {
                         log.warn("订单 {} 状态变迁失败，闹钟可能已触发或订单异常", orderId);
-                        // Todo: 触发退款逻辑.....
                         return Mono.empty();
                     }
                 })
                 .doOnError(e -> log.error("支付确认逻辑异常: {}", e.getMessage()))
                 .then();
     }
-
 
     @Override
     public AbstractActor createActor(ActorRuntimeContext actorRuntimeContext, ActorId actorId) {
@@ -124,15 +137,12 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
     public Mono<Void> receiveReminder(String reminderName, Object state, Duration dueTime, Duration period) {
         OrderInfo orderInfo = (OrderInfo) state;
         log.info("【Reminder】收到提醒: {}, 关联订单: {}", reminderName, orderInfo);
-        // 根据闹钟名字判断要做什么（因为一个 Actor 可能有多个闹钟）
         if (reminderName.startsWith(SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT)) {
-            // 处理订单超时
             return handleOrderTimeout(orderInfo);
         }
         return Mono.empty();
     }
 
-    // 具体的超时处理逻辑
     private Mono<Void> handleOrderTimeout(OrderInfo orderInfo) {
         String orderId = orderInfo.getOrderId();
         String userId = orderInfo.getUserId();
@@ -181,14 +191,7 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
                 }));
     }
 
-    /**
-     * 订单创建失败
-     * @param orderId
-     * @param currentStock
-     * @param throwable
-     * @return
-     */
-    private Mono<Boolean> compensateOrderCreationFailure(String orderId, int currentStock, Throwable throwable) {
+    private Mono<Integer> compensateOrderCreationFailure(String orderId, int currentStock, Throwable throwable) {
         log.error("订单 {} 创建链路失败，开始补偿: {}", orderId, throwable.getMessage());
         return unregisterReminder(SystemConstants.REMINDER_PREFIX_ORDER_TIMEOUT + orderId)
                 .onErrorResume(e -> Mono.empty())
@@ -227,5 +230,9 @@ public class TicketActorImpl extends AbstractActor implements TicketActor, Remin
             TicketStock ts = ticketStockService.getById(this.getId().toString());
             return ts != null ? ts.getStock() : 0;
         }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private long elapsedMs(long startNano) {
+        return (System.nanoTime() - startNano) / 1_000_000;
     }
 }

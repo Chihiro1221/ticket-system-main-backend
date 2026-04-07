@@ -28,30 +28,28 @@ public class OrderEventConsumer {
     @Resource
     private OrderInfoService orderInfoService;
 
-    // pubsubName 是你在 dapr/components/pubsub.yaml 中配置的 name
-    // topic 是你发布消息时指定的 topic 名称
     @Topic(pubsubName = DaprConstants.PUBSUB_NAME, name = DaprConstants.TOPIC_ORDER)
     @PostMapping("/handleOrder")
     @Transactional(rollbackFor = Exception.class)
     public void handleOrder(@RequestBody CloudEvent<OrderCreatedEvent> cloudEvent) {
-        log.info("收到订单消息: {}", cloudEvent.getData());
         OrderCreatedEvent event = cloudEvent.getData();
-        // 1. 必须先扣库存 (原子操作)
-        // 利用数据库的行锁特性，确保强一致性
+        long totalStart = System.nanoTime();
+        long stockUpdateStart = System.nanoTime();
+
         boolean updated = ticketStockService.lambdaUpdate()
                 .eq(TicketStock::getId, event.getTicketId())
                 .ge(TicketStock::getStock, event.getStock_count())
                 .setDecrBy(TicketStock::getStock, event.getStock_count())
                 .update();
+        long stockUpdateMs = elapsedMs(stockUpdateStart);
 
         if (!updated) {
             log.error("库存扣减失败，可能是库存不足或并发冲突: {}", event.getTicketId());
-            // 抛出异常触发事务回滚，防止订单插入
             throw new RuntimeException("库存扣减失败");
         }
 
-        // 2. 插入订单 (利用唯一索引防重)
         try {
+            long orderSaveStart = System.nanoTime();
             OrderInfo orderInfo = OrderInfo.builder()
                     .ticketId(event.getTicketId())
                     .orderId(event.getOrderId())
@@ -59,10 +57,17 @@ public class OrderEventConsumer {
                     .status(OrderConstants.ORDER_STATUS_PENDING)
                     .build();
             orderInfoService.save(orderInfo);
+            long orderSaveMs = elapsedMs(orderSaveStart);
+
+            log.info("[订单消费分析] orderId={} total={}ms | 扣数据库库存={}ms | 保存订单={}ms",
+                    event.getOrderId(), elapsedMs(totalStart), stockUpdateMs, orderSaveMs);
         } catch (DuplicateKeyException e) {
-            // 如果触发了唯一索引冲突，说明是重复消息，抛异常回滚，这样库存扣减也不会生效
             log.warn("订单重复处理，自动忽略: {}", event.getOrderId());
             throw e;
         }
+    }
+
+    private long elapsedMs(long startNano) {
+        return (System.nanoTime() - startNano) / 1_000_000;
     }
 }
